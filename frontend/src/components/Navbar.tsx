@@ -23,7 +23,7 @@ export default function Navbar() {
             <Zap size={14} className="text-[var(--accent)]" />
           </div>
           <span className="font-display font-bold text-sm tracking-widest uppercase text-[var(--text)] group-hover:text-[var(--accent)] transition-colors">
-            CodeLens
+            GitChat
           </span>
         </Link>
 
@@ -51,7 +51,7 @@ export default function Navbar() {
 
         {/* GitHub link */}
         <a
-          href="https://github.com"
+          href="https://github.com/ali-imtiyazkhan/chat_with_git_repo"
           target="_blank"
           rel="noopener noreferrer"
           className="text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
