@@ -284,15 +284,33 @@ def _split_docs(docs):
     return all_chunks
 
 def _build_index(chunks):
+    import time
     embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-    BATCH = 100
+    BATCH = 20  # Smaller batches to avoid rate limits
+    MAX_RETRIES = 5
     db = None
     for i in range(0, len(chunks), BATCH):
         batch = chunks[i: i + BATCH]
-        if db is None:
-            db = FAISS.from_documents(batch, embeddings)
-        else:
-            db.add_documents(batch)
+        for attempt in range(MAX_RETRIES):
+            try:
+                if db is None:
+                    db = FAISS.from_documents(batch, embeddings)
+                else:
+                    db.add_documents(batch)
+                break  # Success, move to next batch
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    wait_time = (2 ** attempt) * 5  # 5s, 10s, 20s, 40s, 80s
+                    print(f"[Rate limit] Batch {i//BATCH + 1}: retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    time.sleep(wait_time)
+                    if attempt == MAX_RETRIES - 1:
+                        raise Exception(f"Rate limit exceeded after {MAX_RETRIES} retries. Try again later or use a paid API key.")
+                else:
+                    raise  # Non-rate-limit error, re-raise immediately
+        # Pause between successful batches to stay within quota
+        if i + BATCH < len(chunks):
+            time.sleep(2)
     return db
 
 @app.post("/chat")
