@@ -19,7 +19,7 @@ const dmSans = DM_Sans({
 })
 
 export const metadata: Metadata = {
-  title: 'CodeLens — GitHub Codebase Chatbot',
+  title: 'GitChat — GitHub Codebase Chatbot',
   description: 'Chat with any GitHub repository using AI-powered RAG',
 }
 
