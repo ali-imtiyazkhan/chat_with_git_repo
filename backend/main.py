@@ -44,6 +44,8 @@ class Session:
     repo: Optional[str] = None
     branch: Optional[str] = None
     rag_chain = None
+    vector_db = None          # Keep FAISS db for direct file lookups
+    all_chunks: list = []     # Keep all chunks for file-specific queries
     file_count: int = 0
     chunk_count: int = 0
     indexing: bool = False
@@ -120,6 +122,47 @@ All files in the repository:
         formatted.append(metadata_context)
         
     return "\n\n".join(formatted)
+
+def _extract_mentioned_files(question: str) -> list[str]:
+    """Detect filenames mentioned in the user's question."""
+    mentioned = []
+    q_lower = question.lower()
+    for f in session.file_list:
+        fname = f.split("/")[-1].lower()  # just the filename
+        # Check if the filename appears in the question
+        if fname in q_lower or f.lower() in q_lower:
+            mentioned.append(f)
+    return mentioned
+
+def _get_file_chunks(filenames: list[str]) -> str:
+    """Get all chunks from specific files directly."""
+    file_chunks = []
+    for chunk in session.all_chunks:
+        source = chunk.metadata.get("source", "")
+        if source in filenames:
+            file_chunks.append(f"--- File: {source} ---\n{chunk.page_content}")
+    return "\n\n".join(file_chunks)
+
+def _smart_context(question: str) -> str:
+    """Hybrid context: direct file lookup + semantic search."""
+    parts = []
+    
+    # 1. Check if user is asking about specific files
+    mentioned_files = _extract_mentioned_files(question)
+    if mentioned_files:
+        file_content = _get_file_chunks(mentioned_files)
+        if file_content:
+            parts.append(f"=== DIRECTLY REQUESTED FILE CONTENT ===\n{file_content}")
+    
+    # 2. Also get semantic search results
+    if session.vector_db:
+        retriever = session.vector_db.as_retriever(search_type="mmr", search_kwargs={"k": 6, "fetch_k": 20})
+        semantic_docs = retriever.invoke(question)
+        semantic_context = format_docs(semantic_docs)
+        if semantic_context:
+            parts.append(f"=== SEMANTICALLY RELEVANT CONTEXT ===\n{semantic_context}")
+    
+    return "\n\n".join(parts) if parts else "No relevant context found."
 
 def format_chat_history() -> str:
     if not session.chat_history:
@@ -206,11 +249,13 @@ async def _run_indexing(repo: str, branch: str, token: str):
         session.chunk_count = len(chunks)
 
         db = await loop.run_in_executor(None, _build_index, chunks)
-        retriever = db.as_retriever(search_type="mmr", search_kwargs={"k": 6, "fetch_k": 20})
+        session.vector_db = db
+        session.all_chunks = chunks
 
         model = ChatGoogleGenerativeAI(model="gemini-flash-latest", temperature=0.2)
         template = """You are a helpful assistant that answers questions about a GitHub codebase.
 Use the following retrieved code context and the conversation history to answer the question.
+When the user asks about a specific file, show the COMPLETE code from that file — do not summarize or skip parts.
 If you don't know the answer or the context doesn't contain enough information, say "I cannot find the answer in the codebase."
 Do not make up information. When referencing code, mention the file name.
 
@@ -226,7 +271,7 @@ Helpful Answer:"""
         prompt = ChatPromptTemplate.from_template(template)
         session.rag_chain = (
             {
-                "context": retriever | format_docs,
+                "context": lambda x: _smart_context(x),
                 "chat_history": lambda x: format_chat_history(),
                 "question": RunnablePassthrough()
             }
@@ -360,6 +405,8 @@ def clear_session():
     session.repo = None
     session.branch = None
     session.rag_chain = None
+    session.vector_db = None
+    session.all_chunks = []
     session.file_count = 0
     session.chunk_count = 0
     session.error = None
