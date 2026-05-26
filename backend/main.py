@@ -7,7 +7,6 @@ Wraps the RAG pipeline and exposes REST + SSE endpoints for the Next.js frontend
 import os
 import re
 import asyncio
-import getpass
 from pathlib import Path
 from typing import Optional, AsyncGenerator
 
@@ -17,7 +16,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from langchain_community.document_loaders import GithubFileLoader
+from langchain_core.documents import Document
+import urllib.request
+import zipfile
+import io
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
@@ -47,10 +49,11 @@ class Session:
     indexing: bool = False
     error: Optional[str] = None
     file_list: list[str] = []
+    chat_history: list[dict] = []
 
 session = Session()
 
-# ── Language map & filters ────────────────────────────────────────────────────
+# Language map & filters
 EXTENSION_LANGUAGE_MAP = {
     ".py": Language.PYTHON, ".js": Language.JS, ".jsx": Language.JS,
     ".ts": Language.JS, ".tsx": Language.JS, ".java": Language.JAVA,
@@ -84,25 +87,37 @@ def normalize_repo(raw: str) -> Optional[str]:
         return raw
     return None
 
-# Safe loader
-class SafeGithubFileLoader(GithubFileLoader):
-    def get_file_content_by_path(self, path):
-        try:
-            return super().get_file_content_by_path(path)
-        except UnicodeDecodeError:
-            return None
-
-    def lazy_load(self):
-        for doc in super().lazy_load():
-            if doc.page_content is not None:
-                yield doc
 
 def format_docs(docs):
     formatted = []
     for doc in docs:
         source = doc.metadata.get("source", "unknown")
         formatted.append(f"--- File: {source} ---\n{doc.page_content}")
+    
+    # Inject codebase directory structure and file list metadata to answer structural questions
+    if session.file_list:
+        file_list_str = "\n".join(f"- {f}" for f in session.file_list)
+        metadata_context = f"""--- Codebase File List & Metadata ---
+Repository: {session.repo}
+Branch: {session.branch}
+Total Files: {session.file_count}
+Indexed Chunks: {session.chunk_count}
+
+All files in the repository:
+{file_list_str}
+--------------------------------------"""
+        formatted.append(metadata_context)
+        
     return "\n\n".join(formatted)
+
+def format_chat_history() -> str:
+    if not session.chat_history:
+        return "No previous conversation history."
+    formatted = []
+    for msg in session.chat_history:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        formatted.append(f"{role}: {msg['content']}")
+    return "\n".join(formatted)
 
 # Pydantic models
 class IndexRequest(BaseModel):
@@ -162,6 +177,7 @@ async def index_repo(req: IndexRequest):
     session.chunk_count = 0
     session.error = None
     session.file_list = []
+    session.chat_history = []
     session.indexing = True
 
     asyncio.create_task(_run_indexing(repo, req.branch, github_token))
@@ -183,19 +199,26 @@ async def _run_indexing(repo: str, branch: str, token: str):
 
         model = ChatGoogleGenerativeAI(model="gemini-flash-latest", temperature=0.2)
         template = """You are a helpful assistant that answers questions about a GitHub codebase.
-Use ONLY the following code context retrieved from the repository to answer the question.
+Use the following retrieved code context and the conversation history to answer the question.
 If you don't know the answer or the context doesn't contain enough information, say "I cannot find the answer in the codebase."
 Do not make up information. When referencing code, mention the file name.
 
 Context:
 {context}
 
+Conversation History:
+{chat_history}
+
 Question: {question}
 
 Helpful Answer:"""
         prompt = ChatPromptTemplate.from_template(template)
         session.rag_chain = (
-            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            {
+                "context": retriever | format_docs,
+                "chat_history": lambda x: format_chat_history(),
+                "question": RunnablePassthrough()
+            }
             | prompt | model | StrOutputParser()
         )
         session.error = None
@@ -206,11 +229,46 @@ Helpful Answer:"""
         session.indexing = False
 
 def _load_docs(repo, branch, token):
-    loader = SafeGithubFileLoader(
-        repo=repo, branch=branch, access_token=token,
-        github_api_url="https://api.github.com", file_filter=should_include,
-    )
-    return loader.load()
+    docs = []
+    url = f"https://api.github.com/repos/{repo}/zipball/{branch}"
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"token {token}")
+    req.add_header("User-Agent", "GitHub-Chatbot-Loader")
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            zip_data = response.read()
+    except Exception as e:
+        raise Exception(f"Failed to download repository zipball: {str(e)}")
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+            for member in z.infolist():
+                if member.is_dir():
+                    continue
+                
+                parts = Path(member.filename).parts
+                if len(parts) <= 1:
+                    continue
+                
+                # Reconstruct relative path inside repo (skip the top-level repo folder)
+                relative_path = "/".join(parts[1:])
+                
+                if should_include(relative_path):
+                    try:
+                        content_bytes = z.read(member)
+                        # Try decoding as utf-8, skip files that fail decoding (e.g. binary/images)
+                        content = content_bytes.decode("utf-8")
+                        docs.append(Document(
+                            page_content=content,
+                            metadata={"source": relative_path}
+                        ))
+                    except UnicodeDecodeError:
+                        continue
+    except Exception as e:
+        raise Exception(f"Failed to extract files from zipball: {str(e)}")
+        
+    return docs
 
 def _split_docs(docs):
     default_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
@@ -245,14 +303,16 @@ async def chat(req: ChatRequest):
 
     async def token_stream() -> AsyncGenerator[str, None]:
         try:
-            loop = asyncio.get_event_loop()
-            answer = await loop.run_in_executor(None, session.rag_chain.invoke, req.question)
-            # Stream word by word for effect
-            words = answer.split(" ")
-            for i, word in enumerate(words):
-                chunk = word if i == len(words) - 1 else word + " "
+            full_response = []
+            async for chunk in session.rag_chain.astream(req.question):
+                full_response.append(chunk)
                 yield f"data: {chunk}\n\n"
-                await asyncio.sleep(0.02)
+            
+            # Save conversation history after a successful generation
+            answer = "".join(full_response)
+            session.chat_history.append({"role": "user", "content": req.question})
+            session.chat_history.append({"role": "assistant", "content": answer})
+            
             yield "data: [DONE]\n\n"
         except Exception as e:
             yield f"data: Error: {str(e)}\n\n"
@@ -269,5 +329,10 @@ def clear_session():
     session.chunk_count = 0
     session.error = None
     session.file_list = []
+    session.chat_history = []
     session.indexing = False
     return {"message": "Session cleared."}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

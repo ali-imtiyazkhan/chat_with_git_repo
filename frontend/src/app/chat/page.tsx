@@ -22,21 +22,70 @@ const SUGGESTIONS = [
 ]
 
 function renderContent(text: string) {
-  // Very lightweight markdown-to-html for chat
-  return text
-    .replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) =>
-      `<pre><code class="language-${lang}">${code.replace(/</g, '&lt;')}</code></pre>`
-    )
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
-    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
-    .replace(/^- (.+)$/gm, '<li>$1</li>')
-    .replace(/(<li>.*<\/li>\n?)+/g, s => `<ul>${s}</ul>`)
-    .replace(/\n\n/g, '</p><p>')
-    .replace(/^(?!<[hupoli])(.+)$/gm, '$1')
+  // Auto-close unclosed markdown code blocks for seamless streaming
+  let closedText = text
+  const codeBlockCount = (text.match(/```/g) || []).length
+  if (codeBlockCount % 2 !== 0) {
+    closedText += '\n```'
+  }
+
+  // Escape HTML tags to prevent XSS (except those we inject)
+  let html = closedText
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+
+  //  Render code blocks with language headers and styling
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    const languageName = lang ? lang.toUpperCase() : 'CODE'
+    // Restore standard code formatting
+    const decodedCode = code
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+    return `<div class="code-block-wrapper my-4 border border-[var(--border)] rounded-lg overflow-hidden bg-[var(--surface)]">
+      <div class="flex items-center justify-between px-4 py-2 bg-[var(--surface-2)] border-b border-[var(--border)] text-[10px] font-mono text-[var(--muted)]">
+        <span class="font-bold tracking-widest text-[var(--accent)]">${languageName}</span>
+      </div>
+      <pre class="p-4 overflow-x-auto text-xs font-mono leading-relaxed text-[var(--text)] bg-transparent border-0 m-0"><code>${decodedCode}</code></pre>
+    </div>`
+  })
+
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code class="px-1.5 py-0.5 rounded text-xs font-mono bg-[var(--surface-2)] border border-[var(--border)] text-[var(--accent)]">$1</code>')
+
+  //  Bold & Italic
+  html = html.replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>')
+  html = html.replace(/\*([\s\S]+?)\*/g, '<em>$1</em>')
+
+  //  Headings
+  html = html.replace(/^### (.+)$/gm, '<h3 class="font-display font-bold text-sm text-[var(--accent)] mt-4 mb-2">$1</h3>')
+  html = html.replace(/^## (.+)$/gm, '<h2 class="font-display font-bold text-base text-[var(--accent)] mt-5 mb-2">$1</h2>')
+  html = html.replace(/^# (.+)$/gm, '<h1 class="font-display font-bold text-lg text-[var(--accent)] mt-6 mb-3">$1</h1>')
+
+  //  Lists (Bullet points and Ordered lists)
+  html = html.replace(/^- (.+)/gm, '<li class="bullet">$1</li>')
+  html = html.replace(/((?:<li class="bullet">[\s\S]*?<\/li>\n?)+)/g, '<ul class="list-disc pl-5 my-2">$1</ul>')
+  html = html.replace(/<li class="bullet">/g, '<li class="my-1">')
+  
+  html = html.replace(/^\d+\. (.+)/gm, '<li class="number">$1</li>')
+  html = html.replace(/((?:<li class="number">[\s\S]*?<\/li>\n?)+)/g, '<ol class="list-decimal pl-5 my-2">$1</ol>')
+  html = html.replace(/<li class="number">/g, '<li class="my-1">')
+
+  // Paragraphs and line breaks
+  // Split by double newline to form paragraphs
+  const paragraphs = html.split(/\n\n+/)
+  html = paragraphs.map(p => {
+    p = p.trim()
+    if (!p) return ''
+    // If it already starts with a block-level HTML tag, don't wrap in p
+    if (/^(?:<div|<pre|<ul|<ol|<h1|<h2|<h3)/.test(p)) {
+      return p
+    }
+    return `<p class="mb-3 leading-relaxed text-[var(--text)]">${p.replace(/\n/g, '<br />')}</p>`
+  }).join('\n')
+
+  return html
 }
 
 export default function ChatPage() {
