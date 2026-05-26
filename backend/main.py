@@ -147,14 +147,14 @@ def _smart_context(question: str) -> str:
     """Hybrid context: direct file lookup + semantic search."""
     parts = []
     
-    # 1. Check if user is asking about specific files
+    # Check if user is asking about specific files
     mentioned_files = _extract_mentioned_files(question)
     if mentioned_files:
         file_content = _get_file_chunks(mentioned_files)
         if file_content:
             parts.append(f"=== DIRECTLY REQUESTED FILE CONTENT ===\n{file_content}")
     
-    # 2. Also get semantic search results
+    # Also get semantic search results
     if session.vector_db:
         retriever = session.vector_db.as_retriever(search_type="mmr", search_kwargs={"k": 6, "fetch_k": 20})
         semantic_docs = retriever.invoke(question)
