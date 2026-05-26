@@ -65,14 +65,25 @@ EXTENSION_LANGUAGE_MAP = {
 EXCLUDED_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
     ".pdf", ".zip", ".tar", ".gz", ".exe", ".bin", ".whl", ".lock", ".sum", ".mod",
+    ".woff", ".woff2", ".ttf", ".eot", ".mp3", ".mp4", ".wav", ".avi",
+    ".pyc", ".pyo", ".so", ".dll", ".dylib", ".map",
 }
 EXCLUDED_DIRS = {
     ".git", "node_modules", "__pycache__", ".venv", "venv",
     "dist", "build", ".next", ".nuxt", "coverage",
+    ".cache", ".output", "vendor", "target", "out",
 }
+EXCLUDED_FILENAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock",
+    "Pipfile.lock", "poetry.lock", "Gemfile.lock", "Cargo.lock",
+    ".DS_Store", "Thumbs.db",
+}
+MAX_FILE_SIZE = 50_000  # Skip files > 50KB (likely auto-generated)
 
 def should_include(file_path: str) -> bool:
     p = Path(file_path)
+    if p.name in EXCLUDED_FILENAMES:
+        return False
     for part in p.parts:
         if part in EXCLUDED_DIRS:
             return False
@@ -247,6 +258,10 @@ def _load_docs(repo, branch, token):
                 if member.is_dir():
                     continue
                 
+                # Skip oversized files (likely auto-generated)
+                if member.file_size > MAX_FILE_SIZE:
+                    continue
+                
                 parts = Path(member.filename).parts
                 if len(parts) <= 1:
                     continue
@@ -257,7 +272,6 @@ def _load_docs(repo, branch, token):
                 if should_include(relative_path):
                     try:
                         content_bytes = z.read(member)
-                        # Try decoding as utf-8, skip files that fail decoding (e.g. binary/images)
                         content = content_bytes.decode("utf-8")
                         docs.append(Document(
                             page_content=content,
@@ -271,13 +285,13 @@ def _load_docs(repo, branch, token):
     return docs
 
 def _split_docs(docs):
-    default_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
+    default_splitter = RecursiveCharacterTextSplitter(chunk_size=2500, chunk_overlap=200)
     all_chunks = []
     for doc in docs:
         ext = Path(doc.metadata.get("source", "")).suffix.lower()
         lang = EXTENSION_LANGUAGE_MAP.get(ext)
         splitter = (
-            RecursiveCharacterTextSplitter.from_language(language=lang, chunk_size=1500, chunk_overlap=200)
+            RecursiveCharacterTextSplitter.from_language(language=lang, chunk_size=2500, chunk_overlap=200)
             if lang else default_splitter
         )
         all_chunks.extend(splitter.split_documents([doc]))
@@ -286,11 +300,14 @@ def _split_docs(docs):
 def _build_index(chunks):
     import time
     embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-    BATCH = 20  # Smaller batches to avoid rate limits
-    MAX_RETRIES = 5
+    BATCH = 50  # Balanced batch size
+    MAX_RETRIES = 4
+    total_batches = (len(chunks) + BATCH - 1) // BATCH
     db = None
     for i in range(0, len(chunks), BATCH):
+        batch_num = i // BATCH + 1
         batch = chunks[i: i + BATCH]
+        print(f"[Embedding] Batch {batch_num}/{total_batches} ({len(batch)} chunks)")
         for attempt in range(MAX_RETRIES):
             try:
                 if db is None:
@@ -301,16 +318,16 @@ def _build_index(chunks):
             except Exception as e:
                 error_str = str(e)
                 if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    wait_time = (2 ** attempt) * 5  # 5s, 10s, 20s, 40s, 80s
-                    print(f"[Rate limit] Batch {i//BATCH + 1}: retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    wait_time = (2 ** attempt) * 3  # 3s, 6s, 12s, 24s
+                    print(f"[Rate limit] Batch {batch_num}: retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
                     time.sleep(wait_time)
                     if attempt == MAX_RETRIES - 1:
                         raise Exception(f"Rate limit exceeded after {MAX_RETRIES} retries. Try again later or use a paid API key.")
                 else:
-                    raise  # Non-rate-limit error, re-raise immediately
-        # Pause between successful batches to stay within quota
+                    raise
+        # Brief pause between batches to stay within quota
         if i + BATCH < len(chunks):
-            time.sleep(2)
+            time.sleep(1)
     return db
 
 @app.post("/chat")
