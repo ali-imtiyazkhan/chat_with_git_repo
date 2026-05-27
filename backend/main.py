@@ -305,7 +305,7 @@ async def _run_indexing(repo: str, branch: str, token: str):
                     meta = await loop.run_in_executor(None, _load_cache_metadata, metadata_file)
 
                     # FIX: use the correct embedding model name
-                    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+                    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
                     db = await loop.run_in_executor(None, _load_faiss_db, cache_dir, embeddings)
 
                     session.file_count = meta["file_count"]
@@ -444,7 +444,7 @@ def _split_docs(docs):
 def _build_index(chunks):
     # FIX: use text-embedding-004, which has a higher free-tier quota (1500 RPM)
     # compared to gemini-embedding-001 (15 RPM) — dramatically faster indexing
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
     # FIX: increase batch size now that we're using text-embedding-004
     # It supports up to 250 texts per batch request
