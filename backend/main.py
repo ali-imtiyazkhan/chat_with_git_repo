@@ -7,6 +7,11 @@ Wraps the RAG pipeline and exposes REST + SSE endpoints for the Next.js frontend
 import os
 import re
 import asyncio
+import json
+import pickle
+import shutil
+import time
+import random
 from pathlib import Path
 from typing import Optional, AsyncGenerator
 
@@ -237,20 +242,101 @@ async def index_repo(req: IndexRequest):
     asyncio.create_task(_run_indexing(repo, req.branch, github_token))
     return {"message": f"Indexing started for {repo}@{req.branch}"}
 
+def _get_latest_commit_sha(repo: str, branch: str, token: str) -> Optional[str]:
+    """Fetch latest commit SHA of the branch from GitHub API."""
+    url = f"https://api.github.com/repos/{repo}/branches/{branch}"
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"token {token}")
+    req.add_header("User-Agent", "GitHub-Chatbot-Loader")
+    try:
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            return data["commit"]["sha"]
+    except Exception as e:
+        print(f"[Warning] Failed to fetch commit SHA for {repo}@{branch}: {e}")
+        return None
+
+def _load_cache_metadata(metadata_file: Path) -> dict:
+    with open(metadata_file, "rb") as f:
+        return pickle.load(f)
+
+def _load_faiss_db(cache_dir: Path, embeddings):
+    return FAISS.load_local(str(cache_dir), embeddings, allow_dangerous_deserialization=True)
+
+def _save_cache(repo: str, branch: str, sha: str, db, metadata: dict):
+    cache_base = Path("cache")
+    repo_prefix = f"{repo.replace('/', '_')}_{branch}_"
+    if cache_base.exists():
+        for item in cache_base.iterdir():
+            if item.is_dir() and item.name.startswith(repo_prefix):
+                try:
+                    shutil.rmtree(item)
+                    print(f"[Cache] Removed old cache: {item.name}")
+                except Exception as cleanup_err:
+                    print(f"[Cache] Failed to remove old cache {item.name}: {cleanup_err}")
+                    
+    cache_dir = cache_base / f"{repo_prefix}{sha}"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    db.save_local(str(cache_dir))
+    
+    metadata_file = cache_dir / "metadata.pkl"
+    with open(metadata_file, "wb") as f:
+        pickle.dump(metadata, f)
+    print(f"[Cache] Saved index and metadata to {cache_dir}")
+
 async def _run_indexing(repo: str, branch: str, token: str):
     """Background task: load → split → embed → store."""
     try:
         loop = asyncio.get_event_loop()
-        docs = await loop.run_in_executor(None, _load_docs, repo, branch, token)
-        session.file_count = len(docs)
-        session.file_list = list({d.metadata.get("source", "") for d in docs})
+        
+        # 1. Fetch latest SHA to check cache
+        sha = await loop.run_in_executor(None, _get_latest_commit_sha, repo, branch, token)
+        
+        cache_loaded = False
+        if sha:
+            cache_dir = Path("cache") / f"{repo.replace('/', '_')}_{branch}_{sha}"
+            metadata_file = cache_dir / "metadata.pkl"
+            if cache_dir.exists() and metadata_file.exists():
+                try:
+                    print(f"[Cache] Loading cached index for {repo}@{branch} (SHA: {sha})")
+                    meta = await loop.run_in_executor(None, _load_cache_metadata, metadata_file)
+                    
+                    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+                    db = await loop.run_in_executor(None, _load_faiss_db, cache_dir, embeddings)
+                    
+                    session.file_count = meta["file_count"]
+                    session.file_list = meta["file_list"]
+                    session.chunk_count = meta["chunk_count"]
+                    session.all_chunks = meta["all_chunks"]
+                    session.vector_db = db
+                    cache_loaded = True
+                except Exception as cache_err:
+                    print(f"[Cache] Failed to load cache: {cache_err}. Falling back to fresh indexing.")
+        
+        if not cache_loaded:
+            # Load documents
+            docs = await loop.run_in_executor(None, _load_docs, repo, branch, token)
+            session.file_count = len(docs)
+            session.file_list = list({d.metadata.get("source", "") for d in docs})
 
-        chunks = await loop.run_in_executor(None, _split_docs, docs)
-        session.chunk_count = len(chunks)
+            chunks = await loop.run_in_executor(None, _split_docs, docs)
+            session.chunk_count = len(chunks)
 
-        db = await loop.run_in_executor(None, _build_index, chunks)
-        session.vector_db = db
-        session.all_chunks = chunks
+            db = await loop.run_in_executor(None, _build_index, chunks)
+            session.vector_db = db
+            session.all_chunks = chunks
+            
+            # Save cache if SHA is available
+            if sha:
+                try:
+                    await loop.run_in_executor(None, _save_cache, repo, branch, sha, db, {
+                        "file_count": session.file_count,
+                        "file_list": session.file_list,
+                        "chunk_count": session.chunk_count,
+                        "all_chunks": session.all_chunks
+                    })
+                except Exception as cache_err:
+                    print(f"[Cache] Failed to save cache: {cache_err}")
 
         model = ChatGoogleGenerativeAI(model="gemini-flash-latest", temperature=0.2)
         template = """You are a helpful assistant that answers questions about a GitHub codebase.
@@ -343,16 +429,30 @@ def _split_docs(docs):
     return all_chunks
 
 def _build_index(chunks):
-    import time
     embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-    BATCH = 50  # Balanced batch size
-    MAX_RETRIES = 4
+    BATCH = 100  # Max batch size for Gemini embedding API
+    MAX_RETRIES = 5
     total_batches = (len(chunks) + BATCH - 1) // BATCH
     db = None
+    
+    # We want to maintain at least 4.5 seconds between the start of embedding requests
+    last_request_time = 0.0
+    
     for i in range(0, len(chunks), BATCH):
         batch_num = i // BATCH + 1
         batch = chunks[i: i + BATCH]
+        
+        # Enforce rate-limiting (max 15 RPM -> 1 request per 4 seconds, using 4.5s buffer)
+        elapsed = time.time() - last_request_time
+        MIN_INTERVAL = 4.5
+        if elapsed < MIN_INTERVAL and i > 0:
+            sleep_time = MIN_INTERVAL - elapsed
+            print(f"[Rate limit] Throttling: sleeping for {sleep_time:.2f}s to respect 15 RPM quota...")
+            time.sleep(sleep_time)
+            
+        last_request_time = time.time()
         print(f"[Embedding] Batch {batch_num}/{total_batches} ({len(batch)} chunks)")
+        
         for attempt in range(MAX_RETRIES):
             try:
                 if db is None:
@@ -363,16 +463,15 @@ def _build_index(chunks):
             except Exception as e:
                 error_str = str(e)
                 if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    wait_time = (2 ** attempt) * 3  # 3s, 6s, 12s, 24s
-                    print(f"[Rate limit] Batch {batch_num}: retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    # Exponential backoff with jitter: 5s, 10s, 20s, 40s, 80s
+                    jitter = random.uniform(0.5, 1.5)
+                    wait_time = ((2 ** attempt) * 5) * jitter
+                    print(f"[Rate limit] Batch {batch_num}: retrying in {wait_time:.2f}s (attempt {attempt + 1}/{MAX_RETRIES}) due to 429")
                     time.sleep(wait_time)
                     if attempt == MAX_RETRIES - 1:
                         raise Exception(f"Rate limit exceeded after {MAX_RETRIES} retries. Try again later or use a paid API key.")
                 else:
                     raise
-        # Brief pause between batches to stay within quota
-        if i + BATCH < len(chunks):
-            time.sleep(1)
     return db
 
 @app.post("/chat")
